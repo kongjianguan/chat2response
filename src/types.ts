@@ -30,7 +30,7 @@ export interface InputItem {
 }
 
 export interface ContentPart {
-  type: 'input_text' | 'input_image' | 'input_file' | 'output_text' | 'refusal';
+  type: 'input_text' | 'input_image' | 'input_file' | 'output_text' | 'refusal' | 'reasoning_text';
   text?: string;
   image_url?: string;
   file_url?: string;
@@ -113,6 +113,8 @@ export type StreamEvent =
   | ContentPartDoneEvent
   | OutputTextDeltaEvent
   | OutputTextDoneEvent
+  | ReasoningTextDeltaEvent
+  | ReasoningTextDoneEvent
   | FunctionCallArgumentsDeltaEvent
   | FunctionCallArgumentsDoneEvent;
 
@@ -187,6 +189,22 @@ export interface OutputTextDoneEvent {
   logprobs?: LogProb[];
 }
 
+export interface ReasoningTextDeltaEvent {
+  type: 'response.reasoning_text.delta';
+  item_id: string;
+  output_index: number;
+  content_index: number;
+  delta: string;
+}
+
+export interface ReasoningTextDoneEvent {
+  type: 'response.reasoning_text.done';
+  item_id: string;
+  output_index: number;
+  content_index: number;
+  text: string;
+}
+
 export interface FunctionCallArgumentsDeltaEvent {
   type: 'response.function_call_arguments.delta';
   item_id: string;
@@ -232,6 +250,7 @@ export interface OutputItem {
   name?: string;
   arguments?: string;
   call_id?: string;
+  summary?: { text: string; type: 'summary_text' }[];
 }
 
 export interface ErrorObject {
@@ -254,7 +273,7 @@ export interface Usage {
 // Provider Types
 // ============================================
 
-export type ProviderName = 'glm' | 'kimi' | 'deepseek' | 'minimax';
+export type ProviderName = 'glm' | 'kimi' | 'deepseek' | 'minimax' | 'opencode';
 
 export interface ProviderConfig {
   name: string;

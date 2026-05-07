@@ -92,8 +92,8 @@ app.post('/v1/responses', async (req, res) => {
     
     const providerName: ProviderName = 
       (isProviderSupported(providerHeader) ? providerHeader : null) ||
-      providerFromModel ||
       (process.env.DEFAULT_PROVIDER as ProviderName) || 
+      providerFromModel ||
       'deepseek';
     
     const provider = getProvider(providerName);
@@ -109,7 +109,21 @@ app.post('/v1/responses', async (req, res) => {
     chatRequest = transformRequest(providerName, chatRequest);
     debug('After provider transformation:', JSON.stringify(chatRequest, null, 2));
     
-    // 3. Forward to provider
+    // 3. Skip empty messages – some clients (Codex) send input:[] as init
+    if (!chatRequest.messages || chatRequest.messages.length === 0) {
+      debug('Empty messages, skipping forward');
+      return res.json({
+        id: `resp_${Date.now().toString(36)}`,
+        object: 'response',
+        created_at: Math.floor(Date.now() / 1000),
+        model: chatRequest.model,
+        status: 'completed',
+        input: body.input,
+        output: [],
+      });
+    }
+
+    // 4. Forward to provider
     const targetUrl = `${provider.baseUrl}/chat/completions`;
     debug(`Forwarding to: ${targetUrl}`);
     

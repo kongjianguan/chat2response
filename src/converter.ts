@@ -27,7 +27,7 @@ function debug(...args: unknown[]) {
 // ============================================
 
 export function convertResponsesToChat(body: ResponsesRequest): ChatCompletionRequest {
-  const { model, input, instructions, tools, tool_choice, stream, temperature, max_tokens, top_p, user } = body;
+  const { model, input, instructions, tools, tool_choice, stream, temperature, max_tokens, top_p, user, reasoning_effort } = body;
   
   const messages: ChatMessage[] = [];
   
@@ -92,6 +92,9 @@ export function convertResponsesToChat(body: ResponsesRequest): ChatCompletionRe
     }
   }
   
+  // Map xhigh → max for reasoning effort (Responses API uses xhigh, DeepSeek/opencode uses max)
+  const mappedEffort = reasoning_effort === 'xhigh' ? 'max' : reasoning_effort;
+
   // Convert tools
   const chatTools: ChatTool[] | undefined = tools?.map(convertTool);
   
@@ -105,6 +108,7 @@ export function convertResponsesToChat(body: ResponsesRequest): ChatCompletionRe
     max_tokens,
     top_p,
     user,
+    ...(mappedEffort ? { reasoning_effort: mappedEffort } : {}),
   };
 }
 
@@ -177,20 +181,25 @@ interface StreamState {
   contentIndex: number;
   fullText: string;
   reasoningText: string;
+  reasoningItemId: string;
   isFirstChunk: boolean;
   isOutputItemAdded: boolean;
   isContentPartAdded: boolean;
   isReasoningAdded: boolean;
+  isReasoningDone: boolean;
+  lastFinishReason: string | null;
   isCompleted: boolean;
   currentToolCall?: {
     id: string;
     name: string;
     arguments: string;
+    outputIndex: number;
   };
   completedToolCalls: Array<{
     id: string;
     name: string;
     arguments: string;
+    outputIndex: number;
   }>;
   toolCallOutputIndex: number;
 }
@@ -203,10 +212,13 @@ export function createStreamState(model: string): StreamState {
     contentIndex: 0,
     fullText: '',
     reasoningText: '',
+    reasoningItemId: '',
     isFirstChunk: true,
     isOutputItemAdded: false,
     isContentPartAdded: false,
     isReasoningAdded: false,
+    isReasoningDone: false,
+    lastFinishReason: null,
     isCompleted: false,
     completedToolCalls: [],
     toolCallOutputIndex: 1,
@@ -263,22 +275,26 @@ export function createOutputItemAddedEvent(state: StreamState): StreamEvent {
 }
 
 export function createReasoningOutputItemAddedEvent(state: StreamState): StreamEvent {
+  state.reasoningItemId = `reason_${uuidv4().replace(/-/g, '')}`;
   const item: OutputItem = {
-    id: `reason_${uuidv4().replace(/-/g, '')}`,
+    id: state.reasoningItemId,
     type: 'reasoning',
+    summary: [],
   };
-  
+
+  const outputIndex = state.outputIndex++;
+
   return {
     type: 'response.output_item.added',
-    output_index: state.outputIndex++, // Reasoning is usually the first item
+    output_index: outputIndex,
     item,
   };
 }
 
-export function createReasoningDeltaEvent(state: StreamState, delta: string): StreamEvent {
+export function createReasoningTextDeltaEvent(state: StreamState, delta: string): StreamEvent {
   return {
-    type: 'response.output_text.delta', // Simplified: reuse output_text.delta for reasoning
-    item_id: state.outputItemId, // Note: Simplified mapping
+    type: 'response.reasoning_text.delta',
+    item_id: state.reasoningItemId,
     output_index: state.outputIndex - 1,
     content_index: 0,
     delta,
@@ -351,9 +367,10 @@ export function createResponseCompletedEvent(
   // Add reasoning output item if exists
   if (state.isReasoningAdded) {
     output.push({
-      id: `reason_${uuidv4().replace(/-/g, '')}`,
+      id: state.reasoningItemId || `reason_${uuidv4().replace(/-/g, '')}`,
       type: 'reasoning',
-      content: [{ type: 'output_text', text: state.reasoningText }],
+      content: [{ type: 'reasoning_text', text: state.reasoningText }],
+      summary: [],
     });
   }
 
@@ -392,6 +409,61 @@ export function createResponseCompletedEvent(
   
   return {
     type: 'response.completed',
+    response,
+  };
+}
+
+export function createResponseIncompleteEvent(
+  state: StreamState,
+  model: string,
+  input: ResponsesRequest['input'],
+  usage?: { input_tokens: number; output_tokens: number; total_tokens: number }
+): StreamEvent {
+  const output: OutputItem[] = [];
+  
+  if (state.isReasoningAdded) {
+    output.push({
+      id: state.reasoningItemId || `reason_${uuidv4().replace(/-/g, '')}`,
+      type: 'reasoning',
+      content: [{ type: 'reasoning_text', text: state.reasoningText }],
+      summary: [],
+    });
+  }
+  if (state.fullText || !state.isReasoningAdded) {
+    output.push({
+      id: state.outputItemId,
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: state.fullText }],
+    });
+  }
+  for (const tc of state.completedToolCalls) {
+    output.push({
+      id: tc.id,
+      type: 'function_call',
+      name: tc.name,
+      arguments: tc.arguments,
+      call_id: tc.id,
+    });
+  }
+
+  const reason: 'max_tokens' | 'content_filter' =
+    state.lastFinishReason === 'content_filter' ? 'content_filter' : 'max_tokens';
+
+  const response: ResponseObject = {
+    id: state.responseId,
+    object: 'response',
+    created_at: Math.floor(Date.now() / 1000),
+    model,
+    status: 'incomplete',
+    incomplete_details: { reason },
+    input: typeof input === 'string' ? [{ type: 'message', role: 'user', content: input }] : input,
+    output,
+    usage,
+  };
+  
+  return {
+    type: 'response.incomplete',
     response,
   };
 }
@@ -465,6 +537,34 @@ function formatSSE(event: StreamEvent): string {
   return `data: ${JSON.stringify(event)}\n\n`;
 }
 
+function* finalizeReasoning(state: StreamState): Generator<string> {
+  if (!state.isReasoningAdded || state.isReasoningDone) return;
+  state.isReasoningDone = true;
+
+  const reasoningOutputIndex = state.outputIndex - 1;
+
+  // reasoning_text.done
+  yield formatSSE({
+    type: 'response.reasoning_text.done',
+    item_id: state.reasoningItemId,
+    output_index: reasoningOutputIndex,
+    content_index: 0,
+    text: state.reasoningText,
+  });
+
+  // output_item.done for reasoning
+  yield formatSSE({
+    type: 'response.output_item.done',
+    output_index: reasoningOutputIndex,
+    item: {
+      id: state.reasoningItemId,
+      type: 'reasoning',
+      content: [{ type: 'reasoning_text', text: state.reasoningText }],
+      summary: [],
+    } as unknown as OutputItem,
+  });
+}
+
 // ============================================
 // Main Stream Processing
 // ============================================
@@ -493,10 +593,9 @@ export async function* streamChatToResponses(
       state.currentToolCall = undefined;
     }
 
-    // 1. Finalize Reasoning if added
-    if (state.isReasoningAdded) {
-      // We reuse the output_text.done logic or similar if needed for reasoning
-      // For simplicity in current mapping, we just ensure the item is logically done
+    // 1. Finalize Reasoning if still open (stream ended without normal content)
+    if (state.isReasoningAdded && !state.isReasoningDone) {
+      yield* finalizeReasoning(state);
     }
 
     // 2. Finalize Message Output if added
@@ -513,13 +612,16 @@ export async function* streamChatToResponses(
     // 3. Finalize Tool Calls
     for (let i = 0; i < state.completedToolCalls.length; i++) {
       const tc = state.completedToolCalls[i];
-      const tcOutputIndex = state.isReasoningAdded ? i + 2 : i + 1; // Adjust index if reasoning exists
-      yield formatSSE(createFunctionCallArgumentsDoneEvent(tcOutputIndex, tc.id, tc.arguments));
-      yield formatSSE(createFunctionCallOutputItemDoneEvent(tcOutputIndex, tc.id, tc.name, tc.arguments));
+      yield formatSSE(createFunctionCallArgumentsDoneEvent(tc.outputIndex, tc.id, tc.arguments));
+      yield formatSSE(createFunctionCallOutputItemDoneEvent(tc.outputIndex, tc.id, tc.name, tc.arguments));
     }
     
-    // 4. ALWAYS send response.completed
-    yield formatSSE(createResponseCompletedEvent(state, model, input, usage));
+    // 4. Send appropriate completion event based on finish_reason
+    if (state.lastFinishReason === 'length' || state.lastFinishReason === 'content_filter') {
+      yield formatSSE(createResponseIncompleteEvent(state, model, input, usage));
+    } else {
+      yield formatSSE(createResponseCompletedEvent(state, model, input, usage));
+    }
     state.isCompleted = true;
   };
   
@@ -569,27 +671,25 @@ export async function* streamChatToResponses(
             const choice = chunk.choices[0];
             const reasoningDelta = (choice.delta as any)?.reasoning_content;
             if (reasoningDelta) {
+              // First reasoning chunk: open a reasoning output item
               if (!state.isReasoningAdded) {
                 state.isReasoningAdded = true;
                 yield formatSSE(createReasoningOutputItemAddedEvent(state));
               }
               state.reasoningText += reasoningDelta;
-              // For simplicity, we just send text deltas. 
-              // Codex might need it wrapped differently, but text.delta is usually fine.
-              yield formatSSE({
-                type: 'response.output_text.delta',
-                item_id: state.outputItemId,
-                output_index: state.outputIndex - 1,
-                content_index: 0,
-                delta: reasoningDelta,
-              });
-              continue; // Skip normal content processing if we're in reasoning
+              yield formatSSE(createReasoningTextDeltaEvent(state, reasoningDelta));
+              continue;
             }
 
             // Handle normal content delta
             let delta = choice.delta?.content;
             
             if (delta) {
+              // First content after reasoning: close reasoning item
+              if (state.isReasoningAdded && !state.isReasoningDone) {
+                yield* finalizeReasoning(state);
+              }
+
               // Ensure we have a message output item and content part if content starts
               if (!state.isOutputItemAdded) {
                 yield formatSSE(createOutputItemAddedEvent(state));
@@ -599,8 +699,6 @@ export async function* streamChatToResponses(
               }
 
               state.fullText += delta;
-              
-              // 5. response.output_text.delta
               yield formatSSE(createOutputTextDeltaEvent(state, delta));
             }
             
@@ -614,15 +712,18 @@ export async function* streamChatToResponses(
                     state.completedToolCalls.push({ ...state.currentToolCall });
                   }
                   
+                  const callOutputIndex = state.toolCallOutputIndex;
+                  state.toolCallOutputIndex++;
                   state.currentToolCall = {
                     id: toolCall.id,
                     name: toolCall.function.name,
                     arguments: toolCall.function.arguments || '',
+                    outputIndex: callOutputIndex,
                   };
                   
                   // Emit output_item.added for this function call
                   yield formatSSE(createFunctionCallOutputItemAddedEvent(
-                    state.toolCallOutputIndex++,
+                    callOutputIndex,
                     state.currentToolCall.id,
                     state.currentToolCall.name
                   ));
@@ -651,6 +752,7 @@ export async function* streamChatToResponses(
             
             // Handle finish reason
             if (choice.finish_reason) {
+              state.lastFinishReason = choice.finish_reason;
               debug('Finish reason:', choice.finish_reason);
               
               // Finalize current tool call if present

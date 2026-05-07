@@ -1,4 +1,4 @@
-import type { ProviderConfig, ProviderName, ChatCompletionRequest } from '../types';
+	import type { ProviderConfig, ProviderName, ChatCompletionRequest, ChatMessage } from '../types';
 
 export const PROVIDERS: Record<ProviderName, ProviderConfig> = {
   glm: {
@@ -139,6 +139,45 @@ export const PROVIDERS: Record<ProviderName, ProviderConfig> = {
       return transformed;
     },
   },
+
+  opencode: {
+    name: 'OpenCode',
+    baseUrl: 'https://opencode.ai/zen/go/v1',
+    defaultModel: '',
+    models: [],
+    supportsTools: true,
+    supportsStreaming: true,
+    // Generic OpenAI-compatible proxy — ensure reasoning_content is present on assistant messages
+    // DeepSeek thinking mode requires it; but the Responses API bridge strips it
+    transformRequest: (req: ChatCompletionRequest): ChatCompletionRequest => {
+      if (!req.messages) return req;
+      const PLACEHOLDER = '(reasoning omitted)';
+      const transformed: ChatCompletionRequest = { ...req, messages: req.messages.map(msg => {
+        if (msg.role !== 'assistant') return msg;
+        const anyMsg = msg as unknown as Record<string, unknown>;
+        let rc = anyMsg.reasoning_content;
+
+        // Strip placeholder prefix when reasoning has real content beyond it
+        if (typeof rc === 'string' && rc.startsWith(PLACEHOLDER) && rc.length > PLACEHOLDER.length) {
+          rc = rc.slice(PLACEHOLDER.length).trimStart();
+        }
+
+        if (rc === undefined || rc === null || rc === '') {
+          // DeepSeek requires reasoning_content on assistant msgs in thinking mode.
+          // Our Responses API bridge loses it, so use a placeholder like deepseek-tui.
+          const { reasoning_content: _, ...rest } = anyMsg;
+          return { ...rest, reasoning_content: PLACEHOLDER } as unknown as ChatMessage;
+        }
+        // Return cleaned reasoning_content if it was modified
+        if (rc !== anyMsg.reasoning_content) {
+          const { reasoning_content: _, ...rest } = anyMsg;
+          return { ...rest, reasoning_content: rc } as unknown as ChatMessage;
+        }
+        return msg;
+      })};
+      return transformed;
+    },
+  },
 };
 
 export function getProvider(name: ProviderName): ProviderConfig {
@@ -188,5 +227,6 @@ export function detectProviderFromModel(modelId: string): ProviderName | null {
   if (modelLower.includes('kimi')) return 'kimi';
   if (modelLower.includes('deepseek')) return 'deepseek';
   if (modelLower.includes('minimax')) return 'minimax';
+  // opencode is a generic proxy — not auto-detectable by model name
   return null;
 }
