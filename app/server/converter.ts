@@ -91,7 +91,48 @@ export function convertResponsesToChat(body: ResponsesRequest): ChatCompletionRe
       }
     }
   }
-  
+
+  // --- Sanitize tool_calls pairing ---
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg.role !== 'assistant' || !msg.tool_calls?.length) continue;
+
+    const responseIds = new Set<string>();
+    for (let j = i + 1; j < messages.length; j++) {
+      if (messages[j].role !== 'tool') break;
+      if (messages[j].tool_call_id) responseIds.add(messages[j].tool_call_id);
+    }
+
+    const valid = msg.tool_calls.filter(tc => responseIds.has(tc.id));
+    if (valid.length === msg.tool_calls.length) continue;
+
+    if (valid.length === 0 && typeof msg.content === 'string' && msg.content === '') {
+      messages.splice(i, 1);
+    } else if (valid.length > 0) {
+      msg.tool_calls = valid;
+    } else {
+      delete msg.tool_calls;
+    }
+  }
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role !== 'tool') continue;
+    let matched = false;
+    for (let j = i - 1; j >= 0; j--) {
+      if (messages[j].role === 'tool') continue;
+      if (
+        messages[j].role === 'assistant' &&
+        messages[j].tool_calls?.some(tc => tc.id === messages[i].tool_call_id)
+      ) {
+        matched = true;
+      }
+      break;
+    }
+    if (!matched) {
+      messages.splice(i, 1);
+    }
+  }
+
   // Convert tools
   const chatTools: ChatTool[] | undefined = tools?.map(convertTool);
   

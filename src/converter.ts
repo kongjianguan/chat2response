@@ -91,7 +91,55 @@ export function convertResponsesToChat(body: ResponsesRequest): ChatCompletionRe
       }
     }
   }
-  
+
+  // --- Sanitize tool_calls pairing ---
+  // DeepSeek (and OpenAI spec) require:
+  //   assistant (tool_calls) → tool (response) → [next non-tool]
+  // Remove orphaned tool_calls and orphaned tool messages to avoid 400 errors.
+
+  // Forward pass: remove tool_calls without matching tool responses
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg.role !== 'assistant' || !msg.tool_calls?.length) continue;
+
+    const responseIds = new Set<string>();
+    for (let j = i + 1; j < messages.length; j++) {
+      if (messages[j].role !== 'tool') break;
+      const tid = messages[j].tool_call_id;
+      if (tid) responseIds.add(tid);
+    }
+
+    const valid = msg.tool_calls.filter(tc => responseIds.has(tc.id));
+    if (valid.length === msg.tool_calls.length) continue;
+
+    if (valid.length === 0 && typeof msg.content === 'string' && msg.content === '') {
+      messages.splice(i, 1);
+    } else if (valid.length > 0) {
+      msg.tool_calls = valid;
+    } else {
+      delete msg.tool_calls;
+    }
+  }
+
+  // Backward pass: remove tool messages without a preceding assistant.tool_calls
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role !== 'tool') continue;
+    let matched = false;
+    for (let j = i - 1; j >= 0; j--) {
+      if (messages[j].role === 'tool') continue;
+      if (
+        messages[j].role === 'assistant' &&
+        messages[j].tool_calls?.some(tc => tc.id === messages[i].tool_call_id)
+      ) {
+        matched = true;
+      }
+      break;
+    }
+    if (!matched) {
+      messages.splice(i, 1);
+    }
+  }
+
   // Map xhigh → max for reasoning effort (Responses API uses xhigh, DeepSeek/opencode uses max)
   const mappedEffort = reasoning_effort === 'xhigh' ? 'max' : reasoning_effort;
 
